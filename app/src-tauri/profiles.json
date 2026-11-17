@@ -1,0 +1,56 @@
+{
+  "layouts": [
+    [
+      800,
+      480
+    ],
+    [
+      960,
+      480
+    ],
+    [
+      1280,
+      480
+    ],
+    [
+      1440,
+      540
+    ],
+    [
+      1920,
+      720
+    ]
+  ],
+  "profiles": [
+    {
+      "firmware": "NBTevo_N18032I",
+      "app_framework_sha256": "93f4c7ab7e59c0adf7923b9b491de06165ba9d97bbe7412292e7ddc418ca2123",
+      "core_framework_sha256": "64ba154c68c772f9ca779fc18507f5b34715be58ded4a198b8a62b90d16c3ee0",
+      "evidence": "Dashboard menus rendered on the reference head unit"
+    },
+    {
+      "firmware": "NBTevo_N18092I",
+      "app_framework_sha256": "93f4c7ab7e59c0adf7923b9b491de06165ba9d97bbe7412292e7ddc418ca2123",
+      "core_framework_sha256": "64ba154c68c772f9ca779fc18507f5b34715be58ded4a198b8a62b90d16c3ee0",
+      "evidence": "Exact framework match and owner report"
+    },
+    {
+      "firmware": "NBTevo_P18362I",
+      "app_framework_sha256": "d9c674c210272e8f07473e73e59ed8f23d984d4d30162971bedb56d21c682b28",
+      "core_framework_sha256": "896d9de22fa85f7f5aa4fc2a0e62003c63c41c47186b06f39a2fd4fee06fa5d5",
+      "evidence": "Offline ABI comparison and QNX emulator plugin load with the captured frameworks"
+    },
+    {
+      "firmware": "NBTevo_V20153I",
+      "app_framework_sha256": "085b7f2a9f96734be51621a70a04c24d01525eb5e9852f45c845a7d2f4ae4c67",
+      "core_framework_sha256": "56705e56c349d9ae57a7782bd39b795cfc01391ba8ff155046f32fbe8ffad2cb",
+      "evidence": "Exact match to the capture used for the earlier QNX load check"
+    },
+    {
+      "firmware": "NBTevo_Y24073J",
+      "app_framework_sha256": "ef2488b007d592301d8f21d9aa60771ad552d06b5e97c29e7813e3946644d820",
+      "core_framework_sha256": "cb0e488d1ebe2e30de87bb56f0e93d6a2d76b44309b0b47fef5b0b7cec048973",
+      "evidence": "Exact match to the capture used for the earlier QNX load check"
+    }
+  ]
+}
