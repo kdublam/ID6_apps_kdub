@@ -50,18 +50,31 @@ fn check(name: &str, ok: bool, detail: impl Into<String>) -> Check {
 }
 
 pub fn assess(report: &Report, profiles: &Profiles) -> Assessment {
-    let profile = profiles.profiles.iter().find(|p| p.firmware == report.firmware);
+    let hash = |name: &str| report.frameworks.get(name).map(|f| f.sha256.as_str()).unwrap_or("");
+    let (app, core) = (hash(FRAMEWORKS[0]), hash(FRAMEWORKS[1]));
+    // Profiles are keyed on the framework hashes; the firmware name only picks
+    // the preferred entry when several profiles share identical frameworks.
+    let mut matches = profiles
+        .profiles
+        .iter()
+        .filter(|p| p.app_framework_sha256 == app && p.core_framework_sha256 == core);
+    let first = matches.next();
+    let profile = profiles
+        .profiles
+        .iter()
+        .find(|p| p.firmware == report.firmware && p.app_framework_sha256 == app && p.core_framework_sha256 == core)
+        .or(first);
     let mut checks = vec![check(
         "Firmware",
         profile.is_some(),
-        if profile.is_some() { report.firmware.clone() } else { format!("{} has no verified profile", report.firmware) },
+        match profile {
+            Some(p) if p.firmware == report.firmware => report.firmware.clone(),
+            Some(p) => format!("{} (frameworks match {})", report.firmware, p.firmware),
+            None => format!("{} has no verified profile", report.firmware),
+        },
     )];
-    let hash = |name: &str| report.frameworks.get(name).map(|f| f.sha256.as_str()).unwrap_or("");
-    let expected = profile.map(|p| [&p.app_framework_sha256, &p.core_framework_sha256]);
-    for (i, name) in FRAMEWORKS.iter().enumerate() {
-        let actual = hash(name);
-        let ok = expected.is_some_and(|e| e[i] == actual);
-        checks.push(check(name, ok, actual));
+    for name in FRAMEWORKS.iter() {
+        checks.push(check(name, profile.is_some(), hash(name)));
     }
     let layout = report
         .display
@@ -77,12 +90,9 @@ pub fn assess(report: &Report, profiles: &Profiles) -> Assessment {
             None => "resolution not detected".into(),
         },
     ));
-    let known_hashes = profiles.profiles.iter().any(|p| {
-        p.app_framework_sha256 == hash(FRAMEWORKS[0]) && p.core_framework_sha256 == hash(FRAMEWORKS[1])
-    });
     let verdict = if checks.iter().all(|c| c.ok) {
         Verdict::Supported
-    } else if profile.is_none() && !known_hashes {
+    } else if profile.is_none() {
         Verdict::Unknown
     } else {
         Verdict::PortingNeeded
@@ -124,9 +134,9 @@ mod tests {
     }
 
     #[test]
-    fn matching_hashes_with_unlisted_firmware_needs_porting() {
+    fn matching_hashes_with_unlisted_firmware_is_supported() {
         let (a, c) = reference();
-        assert_eq!(assess(&report("NBTevo_Z99999Z", &a, &c, Some((1280, 480))), &load()).verdict, Verdict::PortingNeeded);
+        assert_eq!(assess(&report("NBTevo_Z99999Z", &a, &c, Some((1280, 480))), &load()).verdict, Verdict::Supported);
     }
 
     #[test]
