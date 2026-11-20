@@ -12,6 +12,9 @@ use std::process::{Command, Stdio};
 
 const SSH: &str = "/usr/bin/ssh";
 const SSH_KEYGEN: &str = "/usr/bin/ssh-keygen";
+/// Default root password of the head unit's temporary SSH. Used when the user does not enter one.
+const DEFAULT_PASSWORD: &str = "ts&SK412";
+const EXTRA_PATH: &str = "/bin:/usr/bin:/usr/sbin:/sbin:/usr/local/bin:/proc/boot";
 const MAX_OUTPUT: u64 = 4 << 20;
 const LEGACY: [&str; 4] = [
     "HostKeyAlgorithms=+ssh-rsa",
@@ -92,6 +95,7 @@ fn fingerprint(known_hosts: &Path) -> Result<String, String> {
 
 /// Connects without authenticating, stores the host key and returns its fingerprint for the user to confirm.
 pub fn probe_host_key(ip: Ipv4Addr) -> Result<String, String> {
+    crate::applog::line(&format!("probe host key {ip}"));
     let known_hosts = known_hosts_path(ip);
     let _ = fs::remove_file(&known_hosts);
     let out = Command::new(SSH)
@@ -135,14 +139,28 @@ pub fn connect(ip: Ipv4Addr, expected: &str, password: Option<&str>) -> Result<C
     if !known_hosts.exists() || fingerprint(&known_hosts)? != expected {
         return Err("the host key changed since you confirmed it. Check the connection and retry".into());
     }
-    let password = password.filter(|p| !p.is_empty()).map(str::to_string);
-    let askpass = if password.is_some() { Some(write_askpass(ip)?) } else { None };
+    let password = Some(password.filter(|p| !p.is_empty()).unwrap_or(DEFAULT_PASSWORD).to_string());
+    let askpass = Some(write_askpass(ip)?);
+    crate::applog::line(&format!("connect {ip}: host key confirmed {expected}"));
     let conn = Connection { ip, known_hosts, password, askpass };
-    run(&conn, "true", false).map_err(|e| format!("SSH login failed: {e}. Enter the password"))?;
+    run(&conn, "true", false).map_err(|e| format!("SSH login failed: {e}. If this unit uses a different password, enter it"))?;
     Ok(conn)
 }
 
-fn exec(conn: &Connection, command: &str) -> Result<Vec<u8>, String> {
+fn exec(conn: &Connection, command: &str, input: Option<&[u8]>) -> Result<Vec<u8>, String> {
+    let started = std::time::Instant::now();
+    let result = exec_inner(conn, command, input);
+    // Never log the password or uploaded file contents: only the command, sizes, status and stderr.
+    let sent = input.map(|d| format!(", {} bytes sent, script/first line: `{}`", d.len(), crate::applog::clip(&String::from_utf8_lossy(&d[..d.len().min(80)]).lines().next().unwrap_or("")))).unwrap_or_default();
+    let outcome = match &result {
+        Ok(out) => format!("ok, {} bytes received", out.len()),
+        Err(e) => format!("FAILED: {}", crate::applog::clip(e)),
+    };
+    crate::applog::line(&format!("ssh root@{} `{}`{sent} -> {outcome} ({} ms)", conn.ip, crate::applog::clip(command), started.elapsed().as_millis()));
+    result
+}
+
+fn exec_inner(conn: &Connection, command: &str, input: Option<&[u8]>) -> Result<Vec<u8>, String> {
     let mut cmd = Command::new(SSH);
     cmd.args(base_args(&conn.known_hosts, "yes"));
     match &conn.askpass {
@@ -157,14 +175,25 @@ fn exec(conn: &Connection, command: &str) -> Result<Vec<u8>, String> {
             cmd.args(["-o", "BatchMode=yes", "-o", "PreferredAuthentications=publickey"]);
         }
     }
+    // The non-interactive SSH shell on the unit can have a minimal PATH; add the usual QNX tool folders.
+    let command = format!("PATH=\"$PATH:{EXTRA_PATH}\"; export PATH; {command}");
     let mut child = cmd
         .arg(format!("root@{}", conn.ip))
         .arg(command)
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("cannot run ssh: {e}"))?;
+    // Feed stdin from a thread so a large upload cannot deadlock against our stdout reads.
+    let writer = input.and_then(|data| {
+        let mut stdin = child.stdin.take()?;
+        let data = data.to_vec();
+        Some(std::thread::spawn(move || {
+            use std::io::Write;
+            let _ = stdin.write_all(&data);
+        }))
+    });
     let mut out = Vec::new();
     child
         .stdout
@@ -183,6 +212,9 @@ fn exec(conn: &Connection, command: &str) -> Result<Vec<u8>, String> {
         let _ = s.take(64 << 10).read_to_string(&mut stderr);
     }
     let status = child.wait().map_err(|e| e.to_string())?;
+    if let Some(w) = writer {
+        let _ = w.join();
+    }
     match status.code() {
         Some(0) => Ok(out),
         Some(code) => Err(format!("exit status {code}: {}", stderr.trim())),
@@ -191,10 +223,15 @@ fn exec(conn: &Connection, command: &str) -> Result<Vec<u8>, String> {
 }
 
 pub fn run(conn: &Connection, command: &str, optional: bool) -> Result<Vec<u8>, String> {
-    match exec(conn, command) {
+    match exec(conn, command, None) {
         Err(_) if optional => Ok(vec![]),
         other => other.map_err(|e| format!("{command} failed over SSH: {e}")),
     }
+}
+
+/// Runs `command` with `input` on its standard input (used for uploads and multi-line scripts).
+pub fn run_input(conn: &Connection, command: &str, input: &[u8]) -> Result<Vec<u8>, String> {
+    exec(conn, command, Some(input))
 }
 
 #[cfg(test)]

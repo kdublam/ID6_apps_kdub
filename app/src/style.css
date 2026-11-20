@@ -21,3 +21,5 @@ code { font-family: ui-monospace, Menlo, monospace; font-size: .8rem; word-break
 .ok { color: #1a8f3c; } .bad { color: #d70015; }
 .verdict { font-size: 1.1rem; font-weight: 600; margin-bottom: 8px; }
 .apps label { opacity: .6; }
+
+.log { max-height: 260px; overflow: auto; font-size: 11px; white-space: pre-wrap; word-break: break-all; background: rgba(127,127,127,.12); padding: 8px; border-radius: 6px; }
