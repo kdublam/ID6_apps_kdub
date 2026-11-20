@@ -172,8 +172,8 @@ async fn install_apps(
         }
         let id = format!("b{}", install::now_secs());
         let (log, mut progress) = open_log(&app, "install")?;
-        let r = install::find_default_root(&mut ssh, &mut progress)
-            .and_then(|root| install::apply(&mut ssh, &root, &local, &id, &staged, &remove, &mut progress));
+        let r = install::prepare_hmi(&mut ssh, &mut progress)
+            .and_then(|(mut hmi, root)| install::apply(&mut hmi, &root, &local, &id, &staged, &remove, &mut progress));
         with_log(r, &log)
     })
     .await
@@ -185,8 +185,8 @@ async fn list_backups(head: String, host_key: String, password: Option<String>) 
     let ip = parse_ip(&head)?;
     tauri::async_runtime::spawn_blocking(move || {
         let mut ssh = session::connect(ip, &host_key, password.as_deref())?;
-        let root = install::find_default_root(&mut ssh, &mut |m: &str| applog::line(&format!("[list_backups] {m}")))?;
-        Ok(install::list_backups(&mut ssh, &root)?
+        let (mut hmi, root) = install::prepare_hmi(&mut ssh, &mut |m: &str| applog::line(&format!("[list_backups] {m}")))?;
+        Ok(install::list_backups(&mut hmi, &root)?
             .into_iter()
             .map(|b| BackupEntry {
                 created: b.id.trim_start_matches('b').parse().unwrap_or(0),
@@ -213,8 +213,8 @@ async fn restore_backup(
     tauri::async_runtime::spawn_blocking(move || {
         let mut ssh = session::connect(ip, &host_key, password.as_deref())?;
         let (log, mut progress) = open_log(&app, "restore")?;
-        let r = install::find_default_root(&mut ssh, &mut progress)
-            .and_then(|root| install::restore(&mut ssh, &root, &local, &backup_id, &mut progress));
+        let r = install::prepare_hmi(&mut ssh, &mut progress)
+            .and_then(|(mut hmi, root)| install::restore(&mut hmi, &root, &local, &backup_id, &mut progress));
         with_log(r, &log)
     })
     .await
@@ -236,8 +236,8 @@ async fn delete_backup(
     tauri::async_runtime::spawn_blocking(move || {
         let mut ssh = session::connect(ip, &host_key, password.as_deref())?;
         let (log, mut progress) = open_log(&app, "delete-backup")?;
-        let r = install::find_default_root(&mut ssh, &mut progress)
-            .and_then(|root| install::delete_backup(&mut ssh, &root, &local, &backup_id, delete_local, &mut progress));
+        let r = install::prepare_hmi(&mut ssh, &mut progress)
+            .and_then(|(mut hmi, root)| install::delete_backup(&mut hmi, &root, &local, &backup_id, delete_local, &mut progress));
         r.map(|_| log.display().to_string()).map_err(|e| format!("{e} (log: {})", log.display()))
     })
     .await
@@ -254,8 +254,8 @@ async fn backup_now(app: tauri::AppHandle, head: String, host_key: String, passw
         let id = format!("b{}", install::now_secs());
         let (log, mut progress) = open_log(&app, "backup")?;
         progress(&format!("Connected to {ip}; backup id {id}"));
-        let r = install::find_default_root(&mut ssh, &mut progress)
-            .and_then(|root| install::backup_all(&mut ssh, &root, &local, &id, &mut progress));
+        let r = install::prepare_hmi(&mut ssh, &mut progress)
+            .and_then(|(mut hmi, root)| install::backup_all(&mut hmi, &root, &local, &id, &mut progress));
         with_log(r, &log)
     })
     .await

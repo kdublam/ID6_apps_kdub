@@ -30,13 +30,13 @@ const ROOT_CANDIDATES: [&str; 5] = [
 
 const FIND_ROOT: &str = r#"echo "node: $(uname -n 2>/dev/null)"
 echo "PATH: $PATH"
-for t in cat ls find mkdir mv cp rm rmdir chmod test; do
+for t in cat ls find mkdir mv cp rm chmod test; do
     if type $t >/dev/null 2>&1; then echo "tool ok: $t = $(type $t 2>&1)"; else echo "tool missing: $t"; fi
 done
 echo "tool folders:"
 ls -d /bin /usr/bin /sbin /usr/sbin /proc/boot /usr/local/bin 2>&1
-for t in find rmdir chmod; do ls /bin/$t /usr/bin/$t /sbin/$t /usr/sbin/$t /proc/boot/$t 2>&1; done
-for t in wc tr head tail df sed; do
+for t in find chmod; do ls /bin/$t /usr/bin/$t /sbin/$t /usr/sbin/$t /proc/boot/$t 2>&1; done
+for t in wc tr head tail df sed rmdir; do
     if type $t >/dev/null 2>&1; then echo "optional tool present (not used): $t"; else echo "optional tool absent (not used): $t"; fi
 done
 for c in __CANDIDATES__; do
@@ -92,6 +92,49 @@ impl Shell for crate::session::Connection {
             None => crate::session::run(self, command, false),
         }
     }
+}
+
+/// Runs commands either directly on the SSH node or forwarded to `hu-omap` via `on -f hu-omap`
+/// on split-node units where SSH lands on `hu-jacinto`.
+pub struct TargetShell<'a> {
+    inner: &'a mut dyn Shell,
+    via_omap: bool,
+}
+
+impl<'a> TargetShell<'a> {
+    pub fn wrap(inner: &'a mut dyn Shell, via_omap: bool) -> Self {
+        Self { inner, via_omap }
+    }
+}
+
+impl Shell for TargetShell<'_> {
+    fn exec(&mut self, command: &str, input: Option<&[u8]>) -> Result<Vec<u8>, String> {
+        if !self.via_omap {
+            return self.inner.exec(command, input);
+        }
+        let wrapped = if command == "sh -s" {
+            "on -f hu-omap sh -s".to_string()
+        } else {
+            format!("on -f hu-omap sh -c {}", q(command))
+        };
+        self.inner.exec(&wrapped, input)
+    }
+}
+
+/// Detects whether SSH landed on `hu-jacinto` (split-node unit) and, if so, wraps the shell to run
+/// HMI commands on `hu-omap`, then locates the HMI data folder.
+pub fn prepare_hmi<'a>(
+    shell: &'a mut dyn Shell,
+    progress: &mut dyn FnMut(&str),
+) -> Result<(TargetShell<'a>, String), String> {
+    let node = String::from_utf8_lossy(&shell.exec("uname -n", None)?).trim().to_string();
+    let via_omap = node.contains("hu-jacinto");
+    if via_omap {
+        progress("SSH landed on hu-jacinto (split-node unit); running HMI operations on hu-omap");
+    }
+    let mut target = TargetShell::wrap(shell, via_omap);
+    let root = find_default_root(&mut target, progress)?;
+    Ok((target, root))
 }
 
 pub struct AppDef {
@@ -343,6 +386,13 @@ apps=__APPS__
 lock="$root/ID6Installer/lock"
 fail() { echo "$1" >&2; exit 1; }
 exists() { test -e "$1" || test -L "$1"; }
+rm_empty_dir() {
+    test -d "$1" && test ! -L "$1" || return 1
+    for m in "$1"/* "$1"/.[!.]* "$1"/..?*; do
+        if exists "$m"; then return 1; fi
+    done
+    rm -rf "$1"
+}
 locked=0
 done_ok=0
 cleanup() {
@@ -364,7 +414,7 @@ cleanup() {
         echo 'Rollback needs inspection. The install lock, staged files and backup were kept.' >&2
         exit 3
     fi
-    rmdir "$lock" || echo 'Could not release the install lock.' >&2
+    rm_empty_dir "$lock" || echo 'Could not release the install lock.' >&2
 }
 trap cleanup 0
 trap 'fail "Publication received a stop signal."' HUP INT TERM
@@ -430,6 +480,13 @@ entries=__ENTRIES__
 lock="$root/ID6Installer/lock"
 fail() { echo "$1" >&2; exit 1; }
 exists() { test -e "$1" || test -L "$1"; }
+rm_empty_dir() {
+    test -d "$1" && test ! -L "$1" || return 1
+    for m in "$1"/* "$1"/.[!.]* "$1"/..?*; do
+        if exists "$m"; then return 1; fi
+    done
+    rm -rf "$1"
+}
 locked=0
 done_ok=0
 cleanup() {
@@ -449,7 +506,7 @@ cleanup() {
         echo 'Rollback needs inspection. The install lock and current folders were kept.' >&2
         exit 3
     fi
-    rmdir "$lock" || echo 'Could not release the install lock.' >&2
+    rm_empty_dir "$lock" || echo 'Could not release the install lock.' >&2
 }
 trap cleanup 0
 trap 'fail "Restore received a stop signal."' HUP INT TERM
@@ -565,7 +622,11 @@ pub fn backup_all(shell: &mut dyn Shell, root: &str, local_root: &Path, id: &str
         return Err("invalid backup id".into());
     }
     precheck(shell, root, progress)?;
-    let listing = String::from_utf8_lossy(&shell.exec(&format!("ls {}/Plugins 2>/dev/null; true", q(root)), None)?).into_owned();
+    let list_cmd = format!(
+        "for d in {}/Plugins/*; do test -e \"$d\" || continue; echo \"${{d##*/}}\"; done\n",
+        q(root)
+    );
+    let listing = script(shell, &list_cmd)?;
     let mut touched: Vec<String> = Vec::new();
     for name in listing.lines().map(str::trim).filter(|n| !n.is_empty()) {
         if !safe_name(name) {
@@ -757,10 +818,12 @@ pub fn restore(shell: &mut dyn Shell, root: &str, local_root: &Path, backup_id: 
                 }
                 let mut files = BTreeMap::new();
                 collect_local(&local.join(&app), Path::new(""), &mut files)?;
+                let workers: &[&str] = APPS.iter().find(|a| a.dir == app).map(|a| a.workers).unwrap_or(&[]);
                 for (rel, bytes) in &files {
                     let path = format!("{bk}/snapshot/{app}/{rel}");
                     let parent = path.rsplit_once('/').map(|p| p.0).unwrap_or(&bk);
-                    shell.exec(&format!("mkdir -p {} && cat > {}", q(parent), q(&path)), Some(bytes))?;
+                    let mode = if workers.contains(&rel.as_str()) { "755" } else { "644" };
+                    shell.exec(&format!("mkdir -p {} && cat > {} && chmod {mode} {}", q(parent), q(&path), q(&path)), Some(bytes))?;
                 }
                 let back = fetch_tree(shell, &format!("{bk}/snapshot/{app}"))?;
                 compare(&files, &back, &format!("re-upload of {app}"))?;
@@ -823,9 +886,29 @@ pub fn delete_backup(shell: &mut dyn Shell, root: &str, local_root: &Path, backu
     let names: Vec<&str> = leftovers.split_whitespace().filter(|n| *n != "." && *n != "..").collect();
     let only_empty_backups = names.is_empty() || names == ["backups"];
     if only_empty_backups {
-        let _ = shell.exec(&format!("rmdir {0}/backups 2>/dev/null; rmdir {0} 2>/dev/null; true", q(&b)), None);
+        let clean_cmd = format!(
+            "exists() {{ test -e \"$1\" || test -L \"$1\"; }}\n\
+             rm_empty_dir() {{\n\
+                 test -d \"$1\" && test ! -L \"$1\" || return 1\n\
+                 for m in \"$1\"/* \"$1\"/.[!.]* \"$1\"/..?*; do\n\
+                     if exists \"$m\"; then return 1; fi\n\
+                 done\n\
+                 rm -rf \"$1\"\n\
+             }}\n\
+             rm_empty_dir {0}/backups 2>/dev/null\n\
+             rm_empty_dir {0} 2>/dev/null\n\
+             true\n",
+            q(&b)
+        );
+        let _ = script(shell, &clean_cmd);
         let gone = shell.exec(&format!("test ! -e {}", q(&b)), None).is_ok();
-        progress(if gone { "No backups remain: the ID6Installer folder was removed from the head unit" } else { "The ID6Installer folder could not be removed" });
+        if gone {
+            progress("No backups remain: the ID6Installer folder was removed from the head unit");
+        } else if shell.exec(&format!("test -d {}/backups", q(&b)), None).is_ok() {
+            progress("Other backups remain: the ID6Installer folder was kept");
+        } else {
+            progress("The ID6Installer folder could not be removed");
+        }
     } else {
         progress(&format!("The ID6Installer folder was kept because it still contains: {}", names.join(", ")));
     }
@@ -878,7 +961,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("id6-unit-bin-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        for tool in ["sh", "cat", "ls", "find", "mkdir", "mv", "cp", "rm", "rmdir", "chmod", "uname", "df", "test"] {
+        for tool in ["sh", "cat", "ls", "find", "mkdir", "mv", "cp", "rm", "chmod", "uname", "df", "test"] {
             for prefix in ["/bin", "/usr/bin", "/sbin"] {
                 let src = format!("{prefix}/{tool}");
                 if Path::new(&src).exists() {
@@ -1131,6 +1214,25 @@ mod tests {
         assert_eq!(std::fs::read_to_string(root.join("Plugins/BoostDeck/original.txt")).unwrap(), "mine");
         assert!(delete_backup(&mut Local, r, &loc, "b11", false, &mut quiet()).unwrap_err().contains("not found"));
         assert!(delete_backup(&mut Local, r, &loc, "../x", false, &mut quiet()).is_err());
+    }
+
+    #[test]
+    fn target_shell_wraps_commands_for_hu_omap() {
+        struct Record(Vec<String>);
+        impl Shell for Record {
+            fn exec(&mut self, command: &str, _input: Option<&[u8]>) -> Result<Vec<u8>, String> {
+                self.0.push(command.to_string());
+                Ok(vec![])
+            }
+        }
+        let mut rec = Record(vec![]);
+        {
+            let mut sh = TargetShell::wrap(&mut rec, true);
+            sh.exec("sh -s", Some(b"true\n")).unwrap();
+            sh.exec("cat '/var/opt/hmi/data/ID5/apps'", None).unwrap();
+        }
+        assert_eq!(rec.0[0], "on -f hu-omap sh -s");
+        assert_eq!(rec.0[1], "on -f hu-omap sh -c 'cat '\\''/var/opt/hmi/data/ID5/apps'\\'''");
     }
 
     #[test]
